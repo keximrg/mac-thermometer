@@ -29,6 +29,26 @@ struct RawSensorSnapshot: Sendable {
 struct FanControlOutcome: Sendable {
     let targets: [Int: Double]
     let error: String?
+    let needsPrivilege: Bool
+
+    init(targets: [Int: Double], error: String?, needsPrivilege: Bool = false) {
+        self.targets = targets
+        self.error = error
+        self.needsPrivilege = needsPrivilege
+    }
+}
+
+enum SMCWriteStatus: Equatable {
+    case success
+    case acceptedWithWarning
+    case notPrivileged
+    case missingKey
+    case rejected(UInt8)
+    case failed
+
+    var succeeded: Bool {
+        self == .success || self == .acceptedWithWarning
+    }
 }
 
 final class HardwareSensorReader {
@@ -38,6 +58,8 @@ final class HardwareSensorReader {
     private let family: ChipFamily
     private var lastDiagnostics: [String]
     private var softwareOwnsFans = false
+    private var resolvedModeKeys: [Int: String] = [:]
+    private var ftstIsHeld = false
 
     init() {
         let smc = SMCReader()
@@ -152,7 +174,14 @@ final class HardwareSensorReader {
         diagnostics.append(contentsOf: diagnosticLine(label: "Storage", metric: storage))
         diagnostics.append(contentsOf: diagnosticLine(label: "Battery", metric: battery))
         diagnostics.append("Fans reported by FNum: \(reportedFanCount)")
-        diagnostics.append("Fan control keys: F0Tg=\(smc?.hasKey("F0Tg") == true), F0Md=\(smc?.hasKey("F0Md") == true), FS!=\(smc?.hasKey("FS! ") == true)")
+        diagnostics.append("SMC write service: \(smc?.writeServiceName ?? "unavailable")")
+        diagnostics.append(
+            "Fan control keys: F0Tg=\(smc?.hasKey("F0Tg") == true), F0md=\(smc?.hasKey("F0md") == true), F0Md=\(smc?.hasKey("F0Md") == true), FS!=\(smc?.hasKey("FS! ") == true), Ftst=\(smc?.hasKey("Ftst") == true)"
+        )
+        if let modeKey = modeKeyLocked(for: 0) {
+            let modeValue = smc?.readUnsigned(modeKey).map(String.init) ?? "unreadable"
+            diagnostics.append("Fan 0 mode key \(modeKey)=\(modeValue)")
+        }
         diagnostics.append(contentsOf: fanResult.fans.map { fan in
             let limits: String
             if let minimum = fan.minRPM, let maximum = fan.maxRPM {
@@ -279,7 +308,25 @@ final class HardwareSensorReader {
 
     private func canControlFansLocked(fanCount: Int) -> Bool {
         guard let smc, fanCount > 0 else { return false }
-        return smc.hasKey("F0Tg") || smc.hasKey("F0Md") || smc.hasKey("FS! ")
+        return smc.hasKey("F0Tg")
+            || modeKeyLocked(for: 0) != nil
+            || smc.hasKey("FS! ")
+            || smc.hasKey("Ftst")
+    }
+
+    private func modeKeyLocked(for index: Int) -> String? {
+        if let cached = resolvedModeKeys[index] {
+            return cached
+        }
+        guard let smc else { return nil }
+        for suffix in ["md", "Md"] {
+            let key = "F\(index)\(suffix)"
+            if smc.hasKey(key) {
+                resolvedModeKeys[index] = key
+                return key
+            }
+        }
+        return nil
     }
 
     private func applyFanControlLocked(
@@ -301,7 +348,7 @@ final class HardwareSensorReader {
         switch mode {
         case .system:
             if softwareOwnsFans {
-                restoreAutomaticFansLocked(fanCount: max(fans.count, 8))
+                restoreAutomaticFansLocked(fanCount: max(fans.count, 1))
             }
             return FanControlOutcome(targets: [:], error: nil)
 
@@ -311,7 +358,7 @@ final class HardwareSensorReader {
                 percent = manualPercent.clamped(to: 0...1)
             } else {
                 guard let temperature = controlTemperature else {
-                    restoreAutomaticFansLocked(fanCount: 8)
+                    restoreAutomaticFansLocked(fanCount: max(fans.count, 1))
                     return FanControlOutcome(
                         targets: [:],
                         error: "缺少芯片温度，已交还系统控制"
@@ -338,15 +385,29 @@ final class HardwareSensorReader {
             var targets: [Int: Double] = [:]
             var anySuccess = false
             var lastFailure: String?
+            var needsPrivilege = false
 
             for fan in fans {
                 let minimum = fan.minRPM ?? 0
                 let maximum = fan.maxRPM ?? max(fan.rpm, 4_000)
                 let ceiling = max(maximum, minimum)
                 let target = (minimum + percent * (ceiling - minimum)).clamped(to: minimum...ceiling)
-                let forced = setFanForcedLocked(fan.index, forced: true)
-                let wrote = smc.writeNumber("F\(fan.index)Tg", target)
-                if forced || wrote {
+                let modeStatus = setFanForcedLocked(fan.index, forced: true)
+                if modeStatus == .notPrivileged {
+                    needsPrivilege = true
+                    lastFailure = "需要管理员权限才能调节风扇"
+                    continue
+                }
+
+                let targetKey = "F\(fan.index)Tg"
+                let wrote = smc.writeNumberStatus(targetKey, target)
+                if wrote == .notPrivileged {
+                    needsPrivilege = true
+                    lastFailure = "需要管理员权限才能调节风扇"
+                    continue
+                }
+
+                if modeStatus.succeeded || wrote.succeeded {
                     anySuccess = true
                     targets[fan.index] = target
                 } else {
@@ -357,7 +418,8 @@ final class HardwareSensorReader {
             if !anySuccess {
                 return FanControlOutcome(
                     targets: [:],
-                    error: lastFailure ?? "风扇转速写入失败"
+                    error: lastFailure ?? "风扇转速写入失败",
+                    needsPrivilege: needsPrivilege
                 )
             }
             softwareOwnsFans = true
@@ -366,34 +428,71 @@ final class HardwareSensorReader {
     }
 
     private func restoreAutomaticFansLocked(fanCount: Int?) {
-        guard smc != nil else { return }
+        guard let smc else { return }
         let count = min(max(fanCount ?? 8, 1), 16)
         for index in 0..<count {
             _ = setFanForcedLocked(index, forced: false)
         }
-        if smc?.hasKey("FS! ") == true {
-            _ = smc?.writeNumber("FS! ", 0)
+        if smc.hasKey("FS! ") {
+            _ = smc.writeNumber("FS! ", 0)
+        }
+        if ftstIsHeld || smc.hasKey("Ftst") {
+            _ = smc.writeNumber("Ftst", 0)
+            ftstIsHeld = false
         }
         softwareOwnsFans = false
     }
 
-    private func setFanForcedLocked(_ index: Int, forced: Bool) -> Bool {
-        guard let smc else { return false }
-        var wrote = false
-        let modeKey = "F\(index)Md"
-        if smc.hasKey(modeKey) {
-            wrote = smc.writeNumber(modeKey, forced ? 1 : 0) || wrote
+    @discardableResult
+    private func setFanForcedLocked(_ index: Int, forced: Bool) -> SMCWriteStatus {
+        guard let smc else { return .failed }
+        var statuses: [SMCWriteStatus] = []
+
+        if let modeKey = modeKeyLocked(for: index) {
+            let desired = forced ? 1.0 : 0.0
+            var status = smc.writeNumberStatus(modeKey, desired)
+            if forced, !status.succeeded, status != .notPrivileged, smc.hasKey("Ftst") {
+                let unlock = smc.writeNumberStatus("Ftst", 1)
+                if unlock == .notPrivileged {
+                    return .notPrivileged
+                }
+                if unlock.succeeded {
+                    ftstIsHeld = true
+                    Thread.sleep(forTimeInterval: 0.5)
+                    let deadline = Date().addingTimeInterval(8)
+                    while Date() < deadline {
+                        status = smc.writeNumberStatus(modeKey, desired)
+                        if status.succeeded || status == .notPrivileged {
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                }
+            }
+            statuses.append(status)
         }
+
         if smc.hasKey("FS! ") {
+            let bitStatus: SMCWriteStatus
             if let current = smc.readUnsigned("FS! ") {
                 let mask: UInt64 = 1 << index
                 let next = forced ? (current | mask) : (current & ~mask)
-                wrote = smc.writeNumber("FS! ", Double(next)) || wrote
+                bitStatus = smc.writeNumberStatus("FS! ", Double(next))
             } else if !forced {
-                wrote = smc.writeNumber("FS! ", 0) || wrote
+                bitStatus = smc.writeNumberStatus("FS! ", 0)
+            } else {
+                bitStatus = .failed
             }
+            statuses.append(bitStatus)
         }
-        return wrote
+
+        if statuses.contains(.notPrivileged) {
+            return .notPrivileged
+        }
+        if statuses.contains(where: \.succeeded) {
+            return .success
+        }
+        return statuses.last ?? .missingKey
     }
 
     private func readSmartBatteryTemperature() -> MetricReading? {
@@ -649,36 +748,73 @@ private final class SMCReader {
     private static let readBytesCommand: UInt8 = 5
     private static let writeBytesCommand: UInt8 = 6
     private static let readKeyInfoCommand: UInt8 = 9
+    private static let smcKeyNotWritable: UInt8 = 0x87
+    private static let notPrivileged = Int32(bitPattern: 0xE00002C2)
+    private static let notPermitted = Int32(bitPattern: 0xE00002C1)
 
     private var connection: io_connect_t = 0
+    private var writeConnection: io_connect_t = 0
     private var keyInfoCache: [String: SMCKeyInfoData] = [:]
     private var missingKeys = Set<String>()
     private(set) var serviceName = "unavailable"
+    private(set) var writeServiceName = "unavailable"
 
     init?() {
         guard MemoryLayout<SMCParamStruct>.stride == 80 else { return nil }
 
         for candidate in ["AppleSMCKeysEndpoint", "AppleSMC"] {
-            guard let matching = IOServiceMatching(candidate) else { continue }
-            let service = IOServiceGetMatchingService(kIOMainPortDefault, matching)
-            guard service != 0 else { continue }
-            defer { IOObjectRelease(service) }
-
-            var candidateConnection: io_connect_t = 0
-            let result = IOServiceOpen(service, mach_task_self_, 0, &candidateConnection)
-            guard result == kIOReturnSuccess, candidateConnection != 0 else { continue }
-
-            connection = candidateConnection
+            let conn = Self.openNamedService(candidate)
+            guard conn != 0 else { continue }
+            connection = conn
             serviceName = candidate
-            return
+            break
         }
-        return nil
+        guard connection != 0 else { return nil }
+
+        if serviceName == "AppleSMC" {
+            writeConnection = connection
+            writeServiceName = serviceName
+        } else {
+            let appleSMC = Self.openNamedService("AppleSMC")
+            if appleSMC != 0 {
+                writeConnection = appleSMC
+                writeServiceName = "AppleSMC"
+            } else {
+                writeConnection = connection
+                writeServiceName = serviceName
+            }
+        }
     }
 
     deinit {
+        if writeConnection != 0, writeConnection != connection {
+            IOServiceClose(writeConnection)
+        }
         if connection != 0 {
             IOServiceClose(connection)
         }
+    }
+
+    private static func openNamedService(_ name: String) -> io_connect_t {
+        var iterator: io_iterator_t = 0
+        guard let matching = IOServiceMatching(name),
+              IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == kIOReturnSuccess
+        else {
+            return 0
+        }
+        defer { IOObjectRelease(iterator) }
+
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            var conn: io_connect_t = 0
+            let result = IOServiceOpen(service, mach_task_self_, 0, &conn)
+            IOObjectRelease(service)
+            if result == kIOReturnSuccess, conn != 0 {
+                return conn
+            }
+            service = IOIteratorNext(iterator)
+        }
+        return 0
     }
 
     func readTemperature(_ key: String) -> Double? {
@@ -716,12 +852,16 @@ private final class SMCReader {
 
     @discardableResult
     func writeNumber(_ key: String, _ value: Double) -> Bool {
-        guard let info = fetchKeyInfo(key) else { return false }
+        writeNumberStatus(key, value).succeeded
+    }
+
+    func writeNumberStatus(_ key: String, _ value: Double) -> SMCWriteStatus {
+        guard let info = fetchKeyInfo(key) else { return .missingKey }
         let type = Self.fourCharacterString(info.dataType)
         let size = Int(info.dataSize)
         guard size > 0, size <= 32,
               var payload = Self.encodeNumber(value, type: type) else {
-            return false
+            return .failed
         }
         if payload.count < size {
             payload.append(contentsOf: repeatElement(0, count: size - payload.count))
@@ -743,7 +883,8 @@ private final class SMCReader {
         var input = SMCParamStruct()
         input.key = Self.fourCharacterCode(key)
         input.data8 = Self.readKeyInfoCommand
-        guard let output = call(input), output.result == 0,
+        let (output, kernResult) = call(input, connection: connection)
+        guard kernResult == kIOReturnSuccess, let output, output.result == 0,
               output.keyInfo.dataSize > 0, output.keyInfo.dataSize <= 32 else {
             missingKeys.insert(key)
             return nil
@@ -752,15 +893,26 @@ private final class SMCReader {
         return output.keyInfo
     }
 
-    private func writeBytes(_ key: String, _ data: [UInt8], info: SMCKeyInfoData) -> Bool {
+    private func writeBytes(_ key: String, _ data: [UInt8], info: SMCKeyInfoData) -> SMCWriteStatus {
         var input = SMCParamStruct()
         input.key = Self.fourCharacterCode(key)
         input.keyInfo = info
         input.keyInfo.dataSize = UInt32(data.count)
         input.data8 = Self.writeBytesCommand
         input.bytes = Self.packBytes(data)
-        guard let output = call(input), output.result == 0 else { return false }
-        return true
+        let (output, kernResult) = call(input, connection: writeConnection)
+        if Self.isPrivilegeError(kernResult) {
+            return .notPrivileged
+        }
+        guard let output, kernResult == kIOReturnSuccess else { return .failed }
+        if output.result == 0 {
+            return .success
+        }
+        // Some Apple Silicon machines apply target writes despite 0x87.
+        if output.result == Self.smcKeyNotWritable, key.hasSuffix("Tg") {
+            return .acceptedWithWarning
+        }
+        return .rejected(output.result)
     }
 
     private func readValue(_ key: String) -> SMCValue? {
@@ -771,14 +923,15 @@ private final class SMCReader {
         input.keyInfo.dataSize = keyInfo.dataSize
         input.data8 = Self.readBytesCommand
 
-        guard let output = call(input), output.result == 0 else { return nil }
+        let (output, kernResult) = call(input, connection: connection)
+        guard let output, kernResult == kIOReturnSuccess, output.result == 0 else { return nil }
         let bytes = withUnsafeBytes(of: output.bytes) {
             Array($0.prefix(Int(keyInfo.dataSize)))
         }
         return SMCValue(type: Self.fourCharacterString(keyInfo.dataType), bytes: bytes)
     }
 
-    private func call(_ request: SMCParamStruct) -> SMCParamStruct? {
+    private func call(_ request: SMCParamStruct, connection: io_connect_t) -> (SMCParamStruct?, kern_return_t) {
         var input = request
         var output = SMCParamStruct()
         var outputSize = MemoryLayout<SMCParamStruct>.stride
@@ -792,9 +945,13 @@ private final class SMCReader {
             &outputSize
         )
         guard result == kIOReturnSuccess, outputSize >= MemoryLayout<SMCParamStruct>.size else {
-            return nil
+            return (nil, result)
         }
-        return output
+        return (output, result)
+    }
+
+    private static func isPrivilegeError(_ result: kern_return_t) -> Bool {
+        result == notPrivileged || result == notPermitted
     }
 
     private static func encodeNumber(_ value: Double, type: String) -> [UInt8]? {
@@ -805,7 +962,7 @@ private final class SMCReader {
         case "fpe2":
             let scaled = UInt16(clamping: Int((value * 4).rounded()))
             return [UInt8(scaled >> 8), UInt8(scaled & 0xff)]
-        case "ui8 ":
+        case "ui8 ", "flag":
             return [UInt8(clamping: Int(value.rounded()))]
         case "ui16":
             let raw = UInt16(clamping: Int(value.rounded()))

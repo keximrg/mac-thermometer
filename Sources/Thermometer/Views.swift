@@ -582,12 +582,21 @@ private struct FanControlSection: View {
                 }
 
                 if let error = appModel.fanControlError {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(Color.orange)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(11)
-                        .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Color.orange)
+                        if appModel.fanControlNeedsAuthorization {
+                            Button("授权控制风扇") {
+                                appModel.authorizeFanControl()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(11)
+                    .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
                 }
 
                 SettingsPanel(title: "说明", subtitle: nil) {
@@ -595,7 +604,7 @@ private struct FanControlSection: View {
                         Text(statusText)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.secondary)
-                        Text("转速始终限制在硬件报告的最低与最高之间。退出应用、睡眠或改回系统自动时，会把控制权交还给 macOS。")
+                        Text("转速始终限制在硬件报告的最低与最高之间。首次手动控制需要管理员密码。退出应用、睡眠或改回系统自动时，会把控制权交还给 macOS。")
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.tertiary)
                     }
@@ -659,6 +668,9 @@ private struct FanControlSection: View {
     private var statusText: String {
         if appModel.snapshot.fans.isEmpty {
             return "没有检测到可控制的风扇。无风扇机型（例如部分 MacBook Air）会保持这个状态。"
+        }
+        if appModel.fanControlNeedsAuthorization {
+            return "Apple Silicon 改转速需要一次管理员授权。授权后会保持到退出应用。"
         }
         if !appModel.snapshot.fanControlAvailable {
             return "已读到风扇转速，但当前机型不允许软件改写转速。"

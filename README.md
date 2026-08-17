@@ -13,10 +13,12 @@ Thermometer 是原生 macOS 菜单栏硬件温度监视器，可显示 CPU、GPU
 - HUD 使用原生 `NSVisualEffectView` 实时透明毛玻璃效果
 - 风扇控制支持三种模式：系统自动、按温度曲线、自定义转速
 - 按温度模式在芯片够热后提高转速，自定义模式锁定指定转速
+- Apple Silicon 改转速需要一次管理员授权；Intel 机型通常可直接写入
+- 运行时探测 `F0md`/`F0Md`，M3/M4 会走 `Ftst` 解锁，M5 直接写模式键
 - 退出、睡眠或切回系统自动时，把风扇控制权交还给 macOS
 - Apple Silicon M1–M5 与 Intel 运行时动态探测
 - Universal 2（arm64 + x86_64），最低 macOS 13
-- 零网络请求、零第三方运行时依赖、无需 root
+- 零网络请求、零第三方运行时依赖；温度读取无需 root
 
 ## 构建
 
@@ -30,9 +32,9 @@ Thermometer 是原生 macOS 菜单栏硬件温度监视器，可显示 CPU、GPU
 
 Apple 没有为 CPU/GPU 温度提供稳定的公开 API。本项目以只读方式使用 AppleSMC 和 Apple Silicon HID 温度通道，并在接口不可用时显示“—”，不会伪造数据。不同机型可用传感器不同；外接硬盘通常不提供无需驱动即可读取的温度。
 
-风扇转速通过 SMC 读写。默认不改转速；只有选择“按温度”或“自定义”后才会写入目标转速，并限制在硬件报告的最低/最高范围内。部分无风扇或只读机型会保持监视、不提供控制。
+风扇转速通过 SMC 读写。默认不改转速；只有选择“按温度”或“自定义”后才会写入目标转速，并限制在硬件报告的最低/最高范围内。Apple Silicon 写入风扇键需要管理员权限，首次切换到手动控制时会弹出密码框。部分无风扇或只读机型会保持监视、不提供控制。
 
-应用未启用 App Sandbox，适合本机安装和直接分发，不适合 Mac App Store。未配置 Developer ID 时会采用 ad-hoc 签名；其他 Mac 首次启动可能需要在 Finder 中右键选择“打开”。
+应用未启用 App Sandbox，适合本机安装和直接分发，不适合 Mac App Store。未配置 Developer ID 时会采用 ad-hoc 签名；其他 Mac 首次启动可能需要在 Finder 中右键选择“打开”。温度读取无需 root；风扇控制在 Apple Silicon 上需要一次管理员授权。
 
 ## 清理
 

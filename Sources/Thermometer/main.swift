@@ -1,6 +1,11 @@
 import AppKit
 import Foundation
 
+if CommandLine.arguments.contains("--smc-helper") {
+    SMCHelperServer.run()
+    exit(EXIT_SUCCESS)
+}
+
 if CommandLine.arguments.contains("--diagnostics") {
     let reader = HardwareSensorReader()
     let snapshot = reader.sample()

@@ -13,12 +13,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var fanTargets: [Int: Double] = [:]
     @Published private(set) var fanControlError: String?
+    @Published private(set) var fanControlNeedsAuthorization = false
 
     private let sensorQueue = DispatchQueue(label: "com.thermometer.sensors", qos: .utility)
     private var reader: HardwareSensorReader?
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
     private var pendingRefresh = false
+    private var privilegePromptAttempted = false
 
     init(preferences: AppPreferences = AppPreferences()) {
         self.preferences = preferences
@@ -41,6 +43,11 @@ final class AppModel: ObservableObject {
             .removeDuplicates()
             .dropFirst()
             .sink { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
+            .store(in: &cancellables)
+
+        preferences.$fanControlMode
+            .dropFirst()
+            .sink { [weak self] _ in self?.privilegePromptAttempted = false }
             .store(in: &cancellables)
 
         preferences.$fanControlMode
@@ -96,13 +103,12 @@ final class AppModel: ObservableObject {
             }
             let raw = self.reader?.sample()
             let outcome = raw.flatMap { snapshot in
-                self.reader?.applyFanControl(
+                self.applyFanControlOnQueue(
                     mode: mode,
                     manualPercent: manualPercent,
                     curveStartC: curveStartC,
                     curveFullC: curveFullC,
-                    controlTemperature: [snapshot.cpuC, snapshot.gpuC].compactMap { $0 }.max(),
-                    fans: snapshot.fans
+                    snapshot: snapshot
                 )
             }
             DispatchQueue.main.async { [weak self] in
@@ -124,6 +130,11 @@ final class AppModel: ObservableObject {
                     self.lastError = nil
                     self.fanTargets = outcome?.targets ?? [:]
                     self.fanControlError = outcome?.error
+                    if outcome?.needsPrivilege == true {
+                        self.requestFanAuthorizationIfNeeded()
+                    } else if outcome?.error == nil {
+                        self.fanControlNeedsAuthorization = false
+                    }
                     self.appendHistory(value)
                 } else {
                     self.lastError = "暂时无法连接硬件传感器"
@@ -226,6 +237,11 @@ final class AppModel: ObservableObject {
         return (temperature - start) / (full - start)
     }
 
+    func authorizeFanControl() {
+        privilegePromptAttempted = false
+        requestFanAuthorizationIfNeeded()
+    }
+
     func diagnosticLines(completion: @escaping ([String]) -> Void) {
         sensorQueue.async { [weak self] in
             let lines = self?.reader?.diagnosticLines() ?? ["传感器尚未初始化"]
@@ -243,17 +259,69 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func applyFanControlOnQueue(
+        mode: FanControlMode,
+        manualPercent: Double,
+        curveStartC: Double,
+        curveFullC: Double,
+        snapshot: RawSensorSnapshot
+    ) -> FanControlOutcome? {
+        if mode != .system, SMCHelperService.isRunning() {
+            return SMCHelperService.apply(
+                mode: mode,
+                manualPercent: manualPercent,
+                curveStartC: curveStartC,
+                curveFullC: curveFullC
+            )
+        }
+        return reader?.applyFanControl(
+            mode: mode,
+            manualPercent: manualPercent,
+            curveStartC: curveStartC,
+            curveFullC: curveFullC,
+            controlTemperature: [snapshot.cpuC, snapshot.gpuC].compactMap { $0 }.max(),
+            fans: snapshot.fans
+        )
+    }
+
+    private func requestFanAuthorizationIfNeeded() {
+        fanControlNeedsAuthorization = true
+        guard !privilegePromptAttempted else { return }
+        privilegePromptAttempted = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if SMCHelperService.authorizeAndStart() {
+                self.fanControlNeedsAuthorization = false
+                self.fanControlError = nil
+                self.forceRefresh()
+            } else {
+                self.fanControlError = "需要管理员密码才能调节风扇"
+            }
+        }
+    }
+
     private func restoreAutomaticFans() {
+        let fanCount = max(snapshot.fans.count, 1)
         sensorQueue.sync {
-            self.reader?.restoreAutomaticFans(fanCount: 8)
+            if SMCHelperService.isRunning() {
+                SMCHelperService.restore(fanCount: fanCount)
+                if self.timer == nil {
+                    SMCHelperService.shutdown()
+                }
+            }
+            self.reader?.restoreAutomaticFans(fanCount: fanCount)
         }
         fanTargets = [:]
         fanControlError = nil
     }
 
     private func resetReaderAndRefresh() {
+        let fanCount = max(snapshot.fans.count, 1)
         sensorQueue.async { [weak self] in
-            self?.reader?.restoreAutomaticFans(fanCount: 8)
+            if SMCHelperService.isRunning() {
+                SMCHelperService.restore(fanCount: fanCount)
+            }
+            self?.reader?.restoreAutomaticFans(fanCount: fanCount)
             self?.reader = nil
             DispatchQueue.main.async { self?.forceRefresh() }
         }
