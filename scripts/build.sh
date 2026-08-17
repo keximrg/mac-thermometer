@@ -57,5 +57,7 @@ fi
 codesign --force --deep --sign - --timestamp=none "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
+rm -rf "$BUILD_ROOT"
+
 echo "$APP"
 lipo -archs "$APP/Contents/MacOS/Thermometer"

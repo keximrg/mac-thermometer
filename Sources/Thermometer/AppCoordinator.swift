@@ -210,7 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func showAbout() {
         let alert = NSAlert()
         alert.messageText = "Thermometer"
-        alert.informativeText = "原生 Mac 硬件温度与风扇监视器\n\nUniversal 2 · macOS 13+\n传感器数据只在本机读取，不上传网络。"
+        alert.informativeText = "原生 Mac 硬件温度与风扇监视、控制\n\nUniversal 2 · macOS 13+\n传感器数据只在本机读取，不上传网络。"
         if let icon = NSImage(named: "AppIcon") { alert.icon = icon }
         alert.addButton(withTitle: "好")
         alert.runModal()

@@ -23,6 +23,12 @@ struct RawSensorSnapshot: Sendable {
     let fans: [FanReading]
     let sensorCount: Int
     let sourceSummary: String
+    let fanControlAvailable: Bool
+}
+
+struct FanControlOutcome: Sendable {
+    let targets: [Int: Double]
+    let error: String?
 }
 
 final class HardwareSensorReader {
@@ -31,6 +37,7 @@ final class HardwareSensorReader {
     private let hid: HIDTemperatureReader
     private let family: ChipFamily
     private var lastDiagnostics: [String]
+    private var softwareOwnsFans = false
 
     init() {
         let smc = SMCReader()
@@ -145,6 +152,7 @@ final class HardwareSensorReader {
         diagnostics.append(contentsOf: diagnosticLine(label: "Storage", metric: storage))
         diagnostics.append(contentsOf: diagnosticLine(label: "Battery", metric: battery))
         diagnostics.append("Fans reported by FNum: \(reportedFanCount)")
+        diagnostics.append("Fan control keys: F0Tg=\(smc?.hasKey("F0Tg") == true), F0Md=\(smc?.hasKey("F0Md") == true), FS!=\(smc?.hasKey("FS! ") == true)")
         diagnostics.append(contentsOf: fanResult.fans.map { fan in
             let limits: String
             if let minimum = fan.minRPM, let maximum = fan.maxRPM {
@@ -163,8 +171,35 @@ final class HardwareSensorReader {
             batteryC: battery?.value,
             fans: fanResult.fans,
             sensorCount: sensorCount,
-            sourceSummary: sources.joined(separator: ", ")
+            sourceSummary: sources.joined(separator: ", "),
+            fanControlAvailable: canControlFansLocked(fanCount: fanResult.fans.count)
         )
+    }
+
+    func applyFanControl(
+        mode: FanControlMode,
+        manualPercent: Double,
+        curveStartC: Double,
+        curveFullC: Double,
+        controlTemperature: Double?,
+        fans: [FanReading]
+    ) -> FanControlOutcome {
+        lock.lock()
+        defer { lock.unlock() }
+        return applyFanControlLocked(
+            mode: mode,
+            manualPercent: manualPercent,
+            curveStartC: curveStartC,
+            curveFullC: curveFullC,
+            controlTemperature: controlTemperature,
+            fans: fans
+        )
+    }
+
+    func restoreAutomaticFans(fanCount: Int? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        restoreAutomaticFansLocked(fanCount: fanCount)
     }
 
     func diagnosticLines() -> [String] {
@@ -240,6 +275,125 @@ final class HardwareSensorReader {
             )
         }
         return (fans, fanCount)
+    }
+
+    private func canControlFansLocked(fanCount: Int) -> Bool {
+        guard let smc, fanCount > 0 else { return false }
+        return smc.hasKey("F0Tg") || smc.hasKey("F0Md") || smc.hasKey("FS! ")
+    }
+
+    private func applyFanControlLocked(
+        mode: FanControlMode,
+        manualPercent: Double,
+        curveStartC: Double,
+        curveFullC: Double,
+        controlTemperature: Double?,
+        fans: [FanReading]
+    ) -> FanControlOutcome {
+        let available = canControlFansLocked(fanCount: fans.count)
+        guard available else {
+            return FanControlOutcome(
+                targets: [:],
+                error: fans.isEmpty ? nil : "当前机型不支持软件调节风扇"
+            )
+        }
+
+        switch mode {
+        case .system:
+            if softwareOwnsFans {
+                restoreAutomaticFansLocked(fanCount: max(fans.count, 8))
+            }
+            return FanControlOutcome(targets: [:], error: nil)
+
+        case .manual, .temperature:
+            let percent: Double
+            if mode == .manual {
+                percent = manualPercent.clamped(to: 0...1)
+            } else {
+                guard let temperature = controlTemperature else {
+                    restoreAutomaticFansLocked(fanCount: 8)
+                    return FanControlOutcome(
+                        targets: [:],
+                        error: "缺少芯片温度，已交还系统控制"
+                    )
+                }
+                let start = curveStartC.clamped(to: 35...90)
+                let full = max(curveFullC, start + 1)
+                if temperature <= start {
+                    percent = 0
+                } else if temperature >= full {
+                    percent = 1
+                } else {
+                    percent = (temperature - start) / (full - start)
+                }
+            }
+
+            guard let smc else {
+                return FanControlOutcome(
+                    targets: [:],
+                    error: "无法连接 SMC"
+                )
+            }
+
+            var targets: [Int: Double] = [:]
+            var anySuccess = false
+            var lastFailure: String?
+
+            for fan in fans {
+                let minimum = fan.minRPM ?? 0
+                let maximum = fan.maxRPM ?? max(fan.rpm, 4_000)
+                let ceiling = max(maximum, minimum)
+                let target = (minimum + percent * (ceiling - minimum)).clamped(to: minimum...ceiling)
+                let forced = setFanForcedLocked(fan.index, forced: true)
+                let wrote = smc.writeNumber("F\(fan.index)Tg", target)
+                if forced || wrote {
+                    anySuccess = true
+                    targets[fan.index] = target
+                } else {
+                    lastFailure = "无法写入风扇 \(fan.index + 1) 的转速"
+                }
+            }
+
+            if !anySuccess {
+                return FanControlOutcome(
+                    targets: [:],
+                    error: lastFailure ?? "风扇转速写入失败"
+                )
+            }
+            softwareOwnsFans = true
+            return FanControlOutcome(targets: targets, error: nil)
+        }
+    }
+
+    private func restoreAutomaticFansLocked(fanCount: Int?) {
+        guard smc != nil else { return }
+        let count = min(max(fanCount ?? 8, 1), 16)
+        for index in 0..<count {
+            _ = setFanForcedLocked(index, forced: false)
+        }
+        if smc?.hasKey("FS! ") == true {
+            _ = smc?.writeNumber("FS! ", 0)
+        }
+        softwareOwnsFans = false
+    }
+
+    private func setFanForcedLocked(_ index: Int, forced: Bool) -> Bool {
+        guard let smc else { return false }
+        var wrote = false
+        let modeKey = "F\(index)Md"
+        if smc.hasKey(modeKey) {
+            wrote = smc.writeNumber(modeKey, forced ? 1 : 0) || wrote
+        }
+        if smc.hasKey("FS! ") {
+            if let current = smc.readUnsigned("FS! ") {
+                let mask: UInt64 = 1 << index
+                let next = forced ? (current | mask) : (current & ~mask)
+                wrote = smc.writeNumber("FS! ", Double(next)) || wrote
+            } else if !forced {
+                wrote = smc.writeNumber("FS! ", 0) || wrote
+            }
+        }
+        return wrote
     }
 
     private func readSmartBatteryTemperature() -> MetricReading? {
@@ -493,6 +647,7 @@ private struct SMCValue {
 private final class SMCReader {
     private static let kernelSelector: UInt32 = 2
     private static let readBytesCommand: UInt8 = 5
+    private static let writeBytesCommand: UInt8 = 6
     private static let readKeyInfoCommand: UInt8 = 9
 
     private var connection: io_connect_t = 0
@@ -555,25 +710,61 @@ private final class SMCReader {
         }
     }
 
-    private func readValue(_ key: String) -> SMCValue? {
-        guard key.utf8.count == 4, !missingKeys.contains(key) else { return nil }
+    func hasKey(_ key: String) -> Bool {
+        fetchKeyInfo(key) != nil
+    }
 
-        let keyInfo: SMCKeyInfoData
-        if let cached = keyInfoCache[key] {
-            keyInfo = cached
-        } else {
-            var input = SMCParamStruct()
-            input.key = Self.fourCharacterCode(key)
-            input.data8 = Self.readKeyInfoCommand
-
-            guard let output = call(input), output.result == 0,
-                  output.keyInfo.dataSize > 0, output.keyInfo.dataSize <= 32 else {
-                missingKeys.insert(key)
-                return nil
-            }
-            keyInfo = output.keyInfo
-            keyInfoCache[key] = keyInfo
+    @discardableResult
+    func writeNumber(_ key: String, _ value: Double) -> Bool {
+        guard let info = fetchKeyInfo(key) else { return false }
+        let type = Self.fourCharacterString(info.dataType)
+        let size = Int(info.dataSize)
+        guard size > 0, size <= 32,
+              var payload = Self.encodeNumber(value, type: type) else {
+            return false
         }
+        if payload.count < size {
+            payload.append(contentsOf: repeatElement(0, count: size - payload.count))
+        } else if payload.count > size {
+            payload = Array(payload.prefix(size))
+        }
+        return writeBytes(key, payload, info: info)
+    }
+
+    private func fetchKeyInfo(_ key: String) -> SMCKeyInfoData? {
+        guard key.utf8.count == 4 else { return nil }
+        if let cached = keyInfoCache[key] {
+            return cached
+        }
+        if missingKeys.contains(key) {
+            return nil
+        }
+
+        var input = SMCParamStruct()
+        input.key = Self.fourCharacterCode(key)
+        input.data8 = Self.readKeyInfoCommand
+        guard let output = call(input), output.result == 0,
+              output.keyInfo.dataSize > 0, output.keyInfo.dataSize <= 32 else {
+            missingKeys.insert(key)
+            return nil
+        }
+        keyInfoCache[key] = output.keyInfo
+        return output.keyInfo
+    }
+
+    private func writeBytes(_ key: String, _ data: [UInt8], info: SMCKeyInfoData) -> Bool {
+        var input = SMCParamStruct()
+        input.key = Self.fourCharacterCode(key)
+        input.keyInfo = info
+        input.keyInfo.dataSize = UInt32(data.count)
+        input.data8 = Self.writeBytesCommand
+        input.bytes = Self.packBytes(data)
+        guard let output = call(input), output.result == 0 else { return false }
+        return true
+    }
+
+    private func readValue(_ key: String) -> SMCValue? {
+        guard let keyInfo = fetchKeyInfo(key) else { return nil }
 
         var input = SMCParamStruct()
         input.key = Self.fourCharacterCode(key)
@@ -604,6 +795,47 @@ private final class SMCReader {
             return nil
         }
         return output
+    }
+
+    private static func encodeNumber(_ value: Double, type: String) -> [UInt8]? {
+        switch type {
+        case "flt ", "flt":
+            var bits = Float(value).bitPattern
+            return withUnsafeBytes(of: &bits) { Array($0) }
+        case "fpe2":
+            let scaled = UInt16(clamping: Int((value * 4).rounded()))
+            return [UInt8(scaled >> 8), UInt8(scaled & 0xff)]
+        case "ui8 ":
+            return [UInt8(clamping: Int(value.rounded()))]
+        case "ui16":
+            let raw = UInt16(clamping: Int(value.rounded()))
+            return [UInt8(raw >> 8), UInt8(raw & 0xff)]
+        case "ui32":
+            let raw = UInt32(clamping: Int(value.rounded()))
+            return [
+                UInt8((raw >> 24) & 0xff),
+                UInt8((raw >> 16) & 0xff),
+                UInt8((raw >> 8) & 0xff),
+                UInt8(raw & 0xff)
+            ]
+        default:
+            return nil
+        }
+    }
+
+    private static func packBytes(_ data: [UInt8]) -> SMCBytes32 {
+        var packed: SMCBytes32 = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        withUnsafeMutableBytes(of: &packed) { buffer in
+            for (index, byte) in data.prefix(32).enumerated() {
+                buffer[index] = byte
+            }
+        }
+        return packed
     }
 
     private static func decodeNumber(_ value: SMCValue) -> Double? {

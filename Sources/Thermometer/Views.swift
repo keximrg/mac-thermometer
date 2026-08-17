@@ -26,6 +26,11 @@ struct DashboardPopoverView: View {
                         appModel: appModel,
                         preferences: appModel.preferences
                     )
+                case .fans:
+                    FanControlSection(
+                        appModel: appModel,
+                        preferences: appModel.preferences
+                    )
                 case .settings:
                     GeneralSettingsSection(
                         appModel: appModel,
@@ -128,9 +133,9 @@ struct DashboardPopoverView: View {
                 } label: {
                     VStack(spacing: 5) {
                         Image(systemName: section.symbol)
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(.system(size: 11, weight: .semibold))
                         Text(section.title)
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(.system(size: 9, weight: .semibold))
                     }
                     .foregroundStyle(selection == section ? Color.white : Color.white.opacity(0.45))
                     .frame(maxWidth: .infinity)
@@ -199,6 +204,7 @@ private enum DashboardSection: String, CaseIterable, Identifiable {
     case overview
     case menuBar
     case floating
+    case fans
     case settings
 
     var id: String { rawValue }
@@ -208,6 +214,7 @@ private enum DashboardSection: String, CaseIterable, Identifiable {
         case .overview: return "概览"
         case .menuBar: return "菜单栏"
         case .floating: return "悬浮"
+        case .fans: return "风扇"
         case .settings: return "设置"
         }
     }
@@ -217,6 +224,7 @@ private enum DashboardSection: String, CaseIterable, Identifiable {
         case .overview: return "waveform.path.ecg"
         case .menuBar: return "menubar.rectangle"
         case .floating: return "macwindow.on.rectangle"
+        case .fans: return "fan.fill"
         case .settings: return "slider.horizontal.3"
         }
     }
@@ -274,7 +282,9 @@ private struct OverviewSection: View {
                 FanCard(
                     fans: appModel.snapshot.fans,
                     formattedValue: appModel.formatValue(for: .fan),
-                    history: appModel.history[.fan] ?? []
+                    history: appModel.history[.fan] ?? [],
+                    mode: preferences.fanControlMode,
+                    targets: appModel.fanTargets
                 )
 
                 HStack(spacing: 8) {
@@ -381,6 +391,8 @@ private struct FanCard: View {
     let fans: [FanReading]
     let formattedValue: String
     let history: [Double]
+    let mode: FanControlMode
+    let targets: [Int: Double]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
@@ -397,7 +409,7 @@ private struct FanCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("散热风扇")
                         .font(.system(size: 13, weight: .semibold))
-                    Text(fans.isEmpty ? "未检测到可读风扇" : "\(fans.count) 个风扇 · 实时转速")
+                    Text(fans.isEmpty ? "未检测到可读风扇" : "\(fans.count) 个风扇 · \(mode.title)")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.tertiary)
                 }
@@ -418,7 +430,7 @@ private struct FanCard: View {
                 .foregroundStyle(.tertiary)
             } else {
                 ForEach(fans) { fan in
-                    FanProgressRow(fan: fan)
+                    FanProgressRow(fan: fan, targetRPM: targets[fan.index])
                 }
             }
 
@@ -432,6 +444,7 @@ private struct FanCard: View {
 
 private struct FanProgressRow: View {
     let fan: FanReading
+    var targetRPM: Double? = nil
 
     var body: some View {
         HStack(spacing: 9) {
@@ -457,16 +470,247 @@ private struct FanProgressRow: View {
             }
             .frame(height: 5)
 
-            Text("\(Int(fan.rpm.rounded()))")
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 42, alignment: .trailing)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text("\(Int(fan.rpm.rounded()))")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                if let targetRPM {
+                    Text("目标 \(Int(targetRPM.rounded()))")
+                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: 58, alignment: .trailing)
         }
     }
 
     private var progress: CGFloat {
         let maximum = fan.maxRPM ?? max(fan.rpm, 1)
         return CGFloat((fan.rpm / max(maximum, 1)).clamped(to: 0...1))
+    }
+}
+
+private struct FanControlSection: View {
+    @ObservedObject var appModel: AppModel
+    @ObservedObject var preferences: AppPreferences
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                SettingsPanel(title: "控制方式", subtitle: "默认交给系统；只有选中后才会改写风扇转速") {
+                    VStack(spacing: 10) {
+                        HStack(spacing: 7) {
+                            ForEach(FanControlMode.allCases) { mode in
+                                FanModeButton(
+                                    mode: mode,
+                                    selected: preferences.fanControlMode == mode,
+                                    enabled: mode == .system || !appModel.snapshot.fans.isEmpty
+                                ) {
+                                    preferences.fanControlMode = mode
+                                }
+                            }
+                        }
+
+                        Text(preferences.fanControlMode.subtitle)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
+                if !appModel.snapshot.fans.isEmpty {
+                    FanCard(
+                        fans: appModel.snapshot.fans,
+                        formattedValue: appModel.formatValue(for: .fan),
+                        history: appModel.history[.fan] ?? [],
+                        mode: preferences.fanControlMode,
+                        targets: appModel.fanTargets
+                    )
+                }
+
+                if preferences.fanControlMode == .temperature {
+                    SettingsPanel(title: "温度曲线", subtitle: "芯片温度超过启动温度后开始加速，达到满速温度时拉到最高转速") {
+                        VStack(spacing: 13) {
+                            ValueSlider(
+                                title: "启动温度",
+                                symbol: "thermometer.low",
+                                value: startTemperatureBinding,
+                                range: 35...90,
+                                valueText: String(format: "%.0f °C", preferences.fanCurveStartC)
+                            )
+
+                            ValueSlider(
+                                title: "满速温度",
+                                symbol: "thermometer.high",
+                                value: fullTemperatureBinding,
+                                range: 50...105,
+                                valueText: String(format: "%.0f °C", preferences.fanCurveFullC)
+                            )
+
+                            Divider().opacity(0.35)
+
+                            InformationRow(title: "当前芯片", value: currentChipText)
+                            Divider().opacity(0.35)
+                            InformationRow(title: "曲线位置", value: curvePositionText)
+                            Divider().opacity(0.35)
+                            InformationRow(title: "目标转速", value: targetRPMText)
+                        }
+                    }
+                }
+
+                if preferences.fanControlMode == .manual {
+                    SettingsPanel(title: "自定义转速", subtitle: "按每个风扇自己的最低到最高转速范围锁定") {
+                        VStack(spacing: 13) {
+                            ValueSlider(
+                                title: "转速",
+                                symbol: "speedometer",
+                                value: $preferences.fanManualPercent,
+                                range: 0...1,
+                                valueText: String(format: "%.0f%%", preferences.fanManualPercent * 100)
+                            )
+
+                            Divider().opacity(0.35)
+
+                            ForEach(appModel.snapshot.fans) { fan in
+                                InformationRow(
+                                    title: fan.name,
+                                    value: "\(Int(appModel.estimatedFanRPM(for: fan, percent: preferences.fanManualPercent).rounded())) RPM"
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if let error = appModel.fanControlError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(11)
+                        .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
+                }
+
+                SettingsPanel(title: "说明", subtitle: nil) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(statusText)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Text("转速始终限制在硬件报告的最低与最高之间。退出应用、睡眠或改回系统自动时，会把控制权交还给 macOS。")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
+        }
+        .scrollIndicators(.hidden)
+    }
+
+    private var startTemperatureBinding: Binding<Double> {
+        Binding(
+            get: { preferences.fanCurveStartC },
+            set: { newValue in
+                preferences.fanCurveStartC = newValue
+                if preferences.fanCurveFullC <= newValue {
+                    preferences.fanCurveFullC = min(105, newValue + 10)
+                }
+            }
+        )
+    }
+
+    private var fullTemperatureBinding: Binding<Double> {
+        Binding(
+            get: { preferences.fanCurveFullC },
+            set: { newValue in
+                preferences.fanCurveFullC = max(newValue, preferences.fanCurveStartC + 1)
+            }
+        )
+    }
+
+    private var currentChipText: String {
+        guard let temperature = appModel.snapshot.thermalControlTemperature else { return "—" }
+        return appModel.formatTemperature(temperature)
+    }
+
+    private var curvePositionText: String {
+        guard let temperature = appModel.snapshot.thermalControlTemperature else { return "等待温度" }
+        let percent = appModel.temperatureCurvePercent(for: temperature)
+        if percent <= 0 { return "低于启动温度 · 最低转速" }
+        if percent >= 1 { return "达到满速温度 · 最高转速" }
+        return String(format: "加速中 · %.0f%%", percent * 100)
+    }
+
+    private var targetRPMText: String {
+        if let first = appModel.snapshot.fans.first, let target = appModel.fanTargets[first.index] {
+            return "\(Int(target.rounded())) RPM"
+        }
+        guard let first = appModel.snapshot.fans.first,
+              let temperature = appModel.snapshot.thermalControlTemperature else {
+            return "—"
+        }
+        let rpm = appModel.estimatedFanRPM(
+            for: first,
+            percent: appModel.temperatureCurvePercent(for: temperature)
+        )
+        return "\(Int(rpm.rounded())) RPM"
+    }
+
+    private var statusText: String {
+        if appModel.snapshot.fans.isEmpty {
+            return "没有检测到可控制的风扇。无风扇机型（例如部分 MacBook Air）会保持这个状态。"
+        }
+        if !appModel.snapshot.fanControlAvailable {
+            return "已读到风扇转速，但当前机型不允许软件改写转速。"
+        }
+        switch preferences.fanControlMode {
+        case .system:
+            return "当前由 macOS 控制风扇，Thermometer 只显示转速。"
+        case .temperature:
+            return "当前按 CPU/GPU 较高的一侧温度调节风扇。"
+        case .manual:
+            return "当前使用自定义转速，直到改回系统自动或退出应用。"
+        }
+    }
+}
+
+private struct FanModeButton: View {
+    let mode: FanControlMode
+    let selected: Bool
+    var enabled = true
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: symbol)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(selected ? Color.cyan : Color.white.opacity(0.55))
+                Text(mode.title)
+                    .font(.system(size: 9, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(selected ? Color.cyan.opacity(0.12) : Color.white.opacity(0.035))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(selected ? Color.cyan.opacity(0.5) : Color.white.opacity(0.055))
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
+    }
+
+    private var symbol: String {
+        switch mode {
+        case .system: return "gearshape"
+        case .temperature: return "thermometer.medium"
+        case .manual: return "slider.horizontal.3"
+        }
     }
 }
 

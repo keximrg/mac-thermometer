@@ -11,6 +11,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var history: [MetricKind: [Double]] = [:]
     @Published private(set) var isSampling = false
     @Published private(set) var lastError: String?
+    @Published private(set) var fanTargets: [Int: Double] = [:]
+    @Published private(set) var fanControlError: String?
 
     private let sensorQueue = DispatchQueue(label: "com.thermometer.sensors", qos: .utility)
     private var reader: HardwareSensorReader?
@@ -41,8 +43,23 @@ final class AppModel: ObservableObject {
             .sink { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
             .store(in: &cancellables)
 
+        preferences.$fanControlMode
+            .combineLatest(
+                preferences.$fanManualPercent,
+                preferences.$fanCurveStartC,
+                preferences.$fanCurveFullC
+            )
+            .dropFirst()
+            .debounce(for: .milliseconds(80), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.forceRefresh() }
+            .store(in: &cancellables)
+
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
             .sink { [weak self] _ in self?.resetReaderAndRefresh() }
+            .store(in: &cancellables)
+
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
+            .sink { [weak self] _ in self?.restoreAutomaticFans() }
             .store(in: &cancellables)
     }
 
@@ -58,6 +75,7 @@ final class AppModel: ObservableObject {
     func stop() {
         timer?.invalidate()
         timer = nil
+        restoreAutomaticFans()
     }
 
     func forceRefresh() {
@@ -66,6 +84,10 @@ final class AppModel: ObservableObject {
             return
         }
         isSampling = true
+        let mode = preferences.fanControlMode
+        let manualPercent = preferences.fanManualPercent
+        let curveStartC = preferences.fanCurveStartC
+        let curveFullC = preferences.fanCurveFullC
 
         sensorQueue.async { [weak self] in
             guard let self else { return }
@@ -73,6 +95,16 @@ final class AppModel: ObservableObject {
                 self.reader = HardwareSensorReader()
             }
             let raw = self.reader?.sample()
+            let outcome = raw.flatMap { snapshot in
+                self.reader?.applyFanControl(
+                    mode: mode,
+                    manualPercent: manualPercent,
+                    curveStartC: curveStartC,
+                    curveFullC: curveFullC,
+                    controlTemperature: [snapshot.cpuC, snapshot.gpuC].compactMap { $0 }.max(),
+                    fans: snapshot.fans
+                )
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.isSampling = false
@@ -85,13 +117,17 @@ final class AppModel: ObservableObject {
                         fans: raw.fans,
                         timestamp: Date(),
                         sensorCount: raw.sensorCount,
-                        sourceSummary: raw.sourceSummary
+                        sourceSummary: raw.sourceSummary,
+                        fanControlAvailable: raw.fanControlAvailable
                     )
                     self.snapshot = value
                     self.lastError = nil
+                    self.fanTargets = outcome?.targets ?? [:]
+                    self.fanControlError = outcome?.error
                     self.appendHistory(value)
                 } else {
                     self.lastError = "暂时无法连接硬件传感器"
+                    self.fanTargets = [:]
                 }
                 if self.pendingRefresh {
                     self.pendingRefresh = false
@@ -175,6 +211,21 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func estimatedFanRPM(for fan: FanReading, percent: Double) -> Double {
+        let minimum = fan.minRPM ?? 0
+        let maximum = fan.maxRPM ?? max(fan.rpm, 4_000)
+        let ceiling = max(maximum, minimum)
+        return (minimum + percent.clamped(to: 0...1) * (ceiling - minimum)).clamped(to: minimum...ceiling)
+    }
+
+    func temperatureCurvePercent(for temperature: Double) -> Double {
+        let start = preferences.fanCurveStartC
+        let full = max(preferences.fanCurveFullC, start + 1)
+        if temperature <= start { return 0 }
+        if temperature >= full { return 1 }
+        return (temperature - start) / (full - start)
+    }
+
     func diagnosticLines(completion: @escaping ([String]) -> Void) {
         sensorQueue.async { [weak self] in
             let lines = self?.reader?.diagnosticLines() ?? ["传感器尚未初始化"]
@@ -192,8 +243,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func restoreAutomaticFans() {
+        sensorQueue.sync {
+            self.reader?.restoreAutomaticFans(fanCount: 8)
+        }
+        fanTargets = [:]
+        fanControlError = nil
+    }
+
     private func resetReaderAndRefresh() {
         sensorQueue.async { [weak self] in
+            self?.reader?.restoreAutomaticFans(fanCount: 8)
             self?.reader = nil
             DispatchQueue.main.async { self?.forceRefresh() }
         }

@@ -149,6 +149,30 @@ enum TemperatureUnit: String, CaseIterable, Identifiable {
     var title: String { self == .celsius ? "摄氏度 °C" : "华氏度 °F" }
 }
 
+enum FanControlMode: String, CaseIterable, Identifiable {
+    case system
+    case temperature
+    case manual
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: return "系统自动"
+        case .temperature: return "按温度"
+        case .manual: return "自定义"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .system: return "软件不改转速，由 macOS 自行调节"
+        case .temperature: return "芯片够热后按温度曲线提高转速"
+        case .manual: return "将风扇锁定为指定转速"
+        }
+    }
+}
+
 struct SensorSnapshot: Equatable {
     var cpuC: Double?
     var gpuC: Double?
@@ -158,6 +182,7 @@ struct SensorSnapshot: Equatable {
     var timestamp: Date
     var sensorCount: Int
     var sourceSummary: String
+    var fanControlAvailable: Bool
 
     static let empty = SensorSnapshot(
         cpuC: nil,
@@ -167,7 +192,8 @@ struct SensorSnapshot: Equatable {
         fans: [],
         timestamp: .distantPast,
         sensorCount: 0,
-        sourceSummary: "正在连接传感器"
+        sourceSummary: "正在连接传感器",
+        fanControlAvailable: false
     )
 
     func temperature(for metric: MetricKind) -> Double? {
@@ -184,6 +210,10 @@ struct SensorSnapshot: Equatable {
     }
 
     var primaryFanRPM: Double? { fans.first?.rpm }
+
+    var thermalControlTemperature: Double? {
+        [cpuC, gpuC].compactMap { $0 }.max()
+    }
 }
 
 final class AppPreferences: ObservableObject {
@@ -228,6 +258,15 @@ final class AppPreferences: ObservableObject {
     @Published var refreshInterval: Double { didSet { save(refreshInterval, "refreshInterval") } }
     @Published var launchAtLogin: Bool { didSet { save(launchAtLogin, "launchAtLogin") } }
 
+    @Published var fanControlMode: FanControlMode {
+        didSet { save(fanControlMode.rawValue, "fanControlMode") }
+    }
+    @Published var fanManualPercent: Double {
+        didSet { save(fanManualPercent.clamped(to: 0...1), "fanManualPercent") }
+    }
+    @Published var fanCurveStartC: Double { didSet { save(fanCurveStartC, "fanCurveStartC") } }
+    @Published var fanCurveFullC: Double { didSet { save(fanCurveFullC, "fanCurveFullC") } }
+
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         defaults.register(defaults: [
@@ -260,7 +299,11 @@ final class AppPreferences: ObservableObject {
             "temperatureUnit": TemperatureUnit.celsius.rawValue,
             "chipViewMode": ChipViewMode.separate.rawValue,
             "refreshInterval": 2.0,
-            "launchAtLogin": false
+            "launchAtLogin": false,
+            "fanControlMode": FanControlMode.system.rawValue,
+            "fanManualPercent": 0.45,
+            "fanCurveStartC": 55.0,
+            "fanCurveFullC": 85.0
         ])
 
         menuCPU = defaults.bool(forKey: "menuCPU")
@@ -292,6 +335,13 @@ final class AppPreferences: ObservableObject {
         chipViewMode = ChipViewMode(rawValue: defaults.string(forKey: "chipViewMode") ?? "") ?? .separate
         refreshInterval = defaults.double(forKey: "refreshInterval").clamped(to: 1.0...10.0)
         launchAtLogin = defaults.bool(forKey: "launchAtLogin")
+        fanControlMode = FanControlMode(rawValue: defaults.string(forKey: "fanControlMode") ?? "") ?? .system
+        fanManualPercent = defaults.double(forKey: "fanManualPercent").clamped(to: 0...1)
+        fanCurveStartC = defaults.double(forKey: "fanCurveStartC").clamped(to: 35...90)
+        fanCurveFullC = defaults.double(forKey: "fanCurveFullC").clamped(to: 50...105)
+        if fanCurveFullC <= fanCurveStartC {
+            fanCurveFullC = min(105, fanCurveStartC + 10)
+        }
 
         // Earlier builds coupled the overview mode to menu/HUD selections.
         // Migrate that state once, then keep all three surfaces independent.
