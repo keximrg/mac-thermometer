@@ -497,7 +497,7 @@ private struct FanControlSection: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 12) {
-                SettingsPanel(title: "控制方式", subtitle: "默认交给系统；只有选中后才会改写风扇转速") {
+                SettingsPanel(title: "控制方式", subtitle: "启动时授权一次；之后改转速不再要密码") {
                     VStack(spacing: 10) {
                         HStack(spacing: 7) {
                             ForEach(FanControlMode.allCases) { mode in
@@ -586,7 +586,7 @@ private struct FanControlSection: View {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(Color.orange)
-                        if appModel.fanControlNeedsAuthorization {
+                        if appModel.fanControlNeedsAuthorization, !appModel.fanControlAuthorized {
                             Button("授权控制风扇") {
                                 appModel.authorizeFanControl()
                             }
@@ -597,6 +597,13 @@ private struct FanControlSection: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(11)
                     .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
+                } else if appModel.fanControlNeedsAuthorization, !appModel.fanControlAuthorized {
+                    Button("授权控制风扇") {
+                        appModel.authorizeFanControl()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 SettingsPanel(title: "说明", subtitle: nil) {
@@ -604,7 +611,7 @@ private struct FanControlSection: View {
                         Text(statusText)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.secondary)
-                        Text("转速始终限制在硬件报告的最低与最高之间。首次手动控制需要管理员密码。退出应用、睡眠或改回系统自动时，会把控制权交还给 macOS。")
+                        Text("启动时输入一次管理员密码后，本次使用都可直接改转速。退出应用、睡眠或改回系统自动时，会把控制权交还给 macOS。")
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.tertiary)
                     }
@@ -669,8 +676,18 @@ private struct FanControlSection: View {
         if appModel.snapshot.fans.isEmpty {
             return "没有检测到可控制的风扇。无风扇机型（例如部分 MacBook Air）会保持这个状态。"
         }
+        if appModel.fanControlAuthorized {
+            switch preferences.fanControlMode {
+            case .system:
+                return "风扇控制已授权。当前仍由 macOS 自动调节，切换到自定义或按温度后立即生效。"
+            case .temperature:
+                return "风扇控制已授权。当前按 CPU/GPU 较高一侧的温度调节风扇。"
+            case .manual:
+                return "风扇控制已授权。拖动转速即可改，无需再输入密码。"
+            }
+        }
         if appModel.fanControlNeedsAuthorization {
-            return "Apple Silicon 改转速需要一次管理员授权。授权后会保持到退出应用。"
+            return "启动时授权一次即可，授权后改转速不会再要密码。"
         }
         if !appModel.snapshot.fanControlAvailable {
             return "已读到风扇转速，但当前机型不允许软件改写转速。"

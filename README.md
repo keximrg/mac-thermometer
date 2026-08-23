@@ -13,7 +13,7 @@ Thermometer 是原生 macOS 菜单栏硬件温度监视器，可显示 CPU、GPU
 - HUD 使用原生 `NSVisualEffectView` 实时透明毛玻璃效果
 - 风扇控制支持三种模式：系统自动、按温度曲线、自定义转速
 - 按温度模式在芯片够热后提高转速，自定义模式锁定指定转速
-- Apple Silicon 改转速需要一次管理员授权；Intel 机型通常可直接写入
+- Apple Silicon 启动时授权一次管理员密码，之后改转速直接复用，不再重复输入
 - 运行时探测 `F0md`/`F0Md`，M3/M4 会走 `Ftst` 解锁，M5 直接写模式键
 - 退出、睡眠或切回系统自动时，把风扇控制权交还给 macOS
 - Apple Silicon M1–M5 与 Intel 运行时动态探测

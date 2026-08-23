@@ -1,22 +1,23 @@
 import Darwin
 import Foundation
 import AppKit
+import Security
 
 enum SMCHelperService {
     static var socketPath: String {
         "/tmp/thermometer-smc-\(getuid()).sock"
     }
 
-    static func isRunning() -> Bool {
-        ping() != nil
+    static func isPrivilegedHelperRunning() -> Bool {
+        guard let response = ping() else { return false }
+        return response.root == true || response.uid == 0
     }
 
-    @discardableResult
-    static func ping() -> Bool? {
-        switch send(SMCHelperRequest(cmd: "ping")) {
-        case .success(let response):
-            return response.ok
-        case .failure:
+    static func ping() -> SMCHelperResponse? {
+        switch send(SMCHelperRequest(cmd: "ping"), timeoutSeconds: 1.5) {
+        case .success(let response) where response.ok:
+            return response
+        default:
             return nil
         }
     }
@@ -58,40 +59,15 @@ enum SMCHelperService {
 
     static func shutdown() {
         _ = send(SMCHelperRequest(cmd: "quit"), timeoutSeconds: 2)
+        FanPrivilege.shared.releaseSpawnedHelper()
     }
 
-    static func authorizeAndStart() -> Bool {
-        if isRunning() {
+    @discardableResult
+    static func ensureRunning(allowInteraction: Bool) -> Bool {
+        if isPrivilegedHelperRunning() {
             return true
         }
-        guard let executable = Bundle.main.executablePath, !executable.isEmpty else {
-            return false
-        }
-
-        let uid = getuid()
-        let parent = getpid()
-        let quotedExecutable = posixQuoted(executable)
-        let quotedSocket = posixQuoted(socketPath)
-        let shell = "nohup \(quotedExecutable) --smc-helper --socket \(quotedSocket) --uid \(uid) --parent-pid \(parent) >/dev/null 2>&1 &"
-        let source = "do shell script \(appleScriptQuoted(shell)) with administrator privileges"
-        NSApp.activate(ignoringOtherApps: true)
-        var error: NSDictionary?
-        guard let script = NSAppleScript(source: source) else {
-            return false
-        }
-        _ = script.executeAndReturnError(&error)
-        if error != nil {
-            return false
-        }
-
-        let deadline = Date().addingTimeInterval(6)
-        while Date() < deadline {
-            if isRunning() {
-                return true
-            }
-            Thread.sleep(forTimeInterval: 0.15)
-        }
-        return isRunning()
+        return FanPrivilege.shared.startHelper(allowInteraction: allowInteraction)
     }
 
     private static func send(
@@ -152,31 +128,210 @@ enum SMCHelperService {
         }
         return reply.prefix(upTo: newline)
     }
+}
 
-    private static func posixQuoted(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+/// Holds a session AuthorizationRef so the password is asked once and reused.
+private final class FanPrivilege {
+    static let shared = FanPrivilege()
+
+    private let lock = NSLock()
+    private var authRef: AuthorizationRef?
+    private var communicationsPipe: UnsafeMutablePointer<FILE>?
+
+    func startHelper(allowInteraction: Bool) -> Bool {
+        if SMCHelperService.isPrivilegedHelperRunning() {
+            return true
+        }
+        lock.lock()
+        if SMCHelperService.isPrivilegedHelperRunning() {
+            lock.unlock()
+            return true
+        }
+        var started = startWithAuthorizationServices(allowInteraction: allowInteraction)
+        if !started, allowInteraction {
+            started = startWithAppleScript()
+        }
+        lock.unlock()
+        guard started else { return false }
+        return waitUntilRunning()
     }
 
-    private static func appleScriptQuoted(_ value: String) -> String {
-        "\"" + value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        + "\""
+    func releaseSpawnedHelper() {
+        if let pipe = communicationsPipe {
+            fclose(pipe)
+            communicationsPipe = nil
+        }
+    }
+
+    deinit {
+        releaseSpawnedHelper()
+        if let authRef {
+            AuthorizationFree(authRef, [])
+        }
+    }
+
+    private func waitUntilRunning() -> Bool {
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline {
+            if SMCHelperService.isPrivilegedHelperRunning() {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.12)
+        }
+        return SMCHelperService.isPrivilegedHelperRunning()
+    }
+
+    private func obtainRights(allowInteraction: Bool) -> Bool {
+        if authRef == nil {
+            var created: AuthorizationRef?
+            let status = AuthorizationCreate(nil, nil, [], &created)
+            guard status == errAuthorizationSuccess, let created else {
+                return false
+            }
+            authRef = created
+        }
+        guard let authRef else { return false }
+
+        return kAuthorizationRightExecute.withCString { namePointer in
+            var item = AuthorizationItem(
+                name: namePointer,
+                valueLength: 0,
+                value: nil,
+                flags: 0
+            )
+            return withUnsafeMutablePointer(to: &item) { itemPointer in
+                var rights = AuthorizationRights(count: 1, items: itemPointer)
+                var flags: AuthorizationFlags = [.extendRights, .preAuthorize]
+                if allowInteraction {
+                    flags.insert(.interactionAllowed)
+                }
+                NSApp.activate(ignoringOtherApps: true)
+                return AuthorizationCopyRights(authRef, &rights, nil, flags, nil) == errAuthorizationSuccess
+            }
+        }
+    }
+
+    private func startWithAuthorizationServices(allowInteraction: Bool) -> Bool {
+        guard let executable = Bundle.main.executablePath, !executable.isEmpty else {
+            return false
+        }
+        guard obtainRights(allowInteraction: allowInteraction) else {
+            return false
+        }
+        guard let authRef else { return false }
+        guard let exec = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "AuthorizationExecuteWithPrivileges") else {
+            return false
+        }
+        let execute = unsafeBitCast(exec, to: AuthorizationExecuteWithPrivilegesProc.self)
+
+        let socketPath = SMCHelperService.socketPath
+        let uid = String(getuid())
+        let parent = String(getpid())
+        let args = [
+            "--smc-helper",
+            "--foreground",
+            "--socket", socketPath,
+            "--uid", uid,
+            "--parent-pid", parent
+        ]
+
+        let cStrings: [UnsafeMutablePointer<CChar>?] = args.map { strdup($0) } + [nil]
+        defer {
+            cStrings.dropLast().compactMap { $0 }.forEach { free($0) }
+        }
+
+        if let previous = communicationsPipe {
+            fclose(previous)
+            communicationsPipe = nil
+        }
+
+        var pipe: UnsafeMutablePointer<FILE>?
+        var argv = cStrings
+        let status: OSStatus = executable.withCString { path in
+            argv.withUnsafeMutableBufferPointer { buffer in
+                execute(authRef, path, [], buffer.baseAddress, &pipe)
+            }
+        }
+        if status == errAuthorizationSuccess {
+            communicationsPipe = pipe
+            return true
+        }
+        if let pipe {
+            fclose(pipe)
+        }
+        return false
+    }
+
+    private func startWithAppleScript() -> Bool {
+        guard let executable = Bundle.main.executablePath, !executable.isEmpty else {
+            return false
+        }
+        let uid = getuid()
+        let parent = getpid()
+        let perl = """
+        use POSIX qw(setsid); exit 0 if fork; setsid(); exit 0 if fork; chdir "/"; exec @ARGV
+        """
+        let shell = [
+            "/usr/bin/perl",
+            "-e",
+            posixQuoted(perl),
+            posixQuoted(executable),
+            "--smc-helper",
+            "--foreground",
+            "--socket", posixQuoted(SMCHelperService.socketPath),
+            "--uid", String(uid),
+            "--parent-pid", String(parent)
+        ].joined(separator: " ")
+        let source = "do shell script \(appleScriptQuoted(shell)) with administrator privileges"
+        NSApp.activate(ignoringOtherApps: true)
+        var error: NSDictionary?
+        guard let script = NSAppleScript(source: source) else { return false }
+        _ = script.executeAndReturnError(&error)
+        return error == nil
     }
 }
+
+private typealias AuthorizationExecuteWithPrivilegesProc = @convention(c) (
+    AuthorizationRef,
+    UnsafePointer<CChar>,
+    AuthorizationFlags,
+    UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    UnsafeMutablePointer<UnsafeMutablePointer<FILE>?>?
+) -> OSStatus
 
 enum SMCHelperServer {
     static func run() {
         signal(SIGPIPE, SIG_IGN)
 
-        let arguments = CommandLine.arguments
         let socketPath = argumentValue("socket") ?? SMCHelperService.socketPath
         let parentPid = argumentValue("parent-pid").flatMap(Int32.init) ?? 0
         let clientUID = argumentValue("uid").flatMap { uid_t($0) } ?? getuid()
+        let logURL = URL(fileURLWithPath: "/tmp/thermometer-smc-\(clientUID).log")
+
+        func log(_ message: String) {
+            let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+            guard let data = line.data(using: .utf8) else { return }
+            if let handle = try? FileHandle(forWritingTo: logURL) {
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            } else {
+                try? data.write(to: logURL)
+            }
+        }
+
+        log("helper start euid=\(geteuid()) uid=\(getuid()) pid=\(getpid()) socket=\(socketPath)")
+        guard geteuid() == 0 else {
+            log("refusing to run without root")
+            _exit(2)
+        }
 
         unlink(socketPath)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return }
+        guard fd >= 0 else {
+            log("socket() failed errno=\(errno)")
+            return
+        }
         _ = fcntl(fd, F_SETFL, O_NONBLOCK)
 
         var addr = unixAddress(socketPath)
@@ -185,18 +340,21 @@ enum SMCHelperServer {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard bound == 0, listen(fd, 4) == 0 else {
+        guard bound == 0, listen(fd, 8) == 0 else {
+            log("bind/listen failed errno=\(errno)")
             close(fd)
             return
         }
         chmod(socketPath, 0o600)
         let groupID = getpwuid(clientUID)?.pointee.pw_gid ?? 20
         chown(socketPath, clientUID, groupID)
+        log("listening")
 
         let reader = HardwareSensorReader()
         var running = true
 
         func restoreAndExit() {
+            log("restore and exit")
             reader.restoreAutomaticFans(fanCount: 8)
             unlink(socketPath)
             close(fd)
@@ -217,7 +375,7 @@ enum SMCHelperServer {
                 }
             }
             if client < 0 {
-                usleep(200_000)
+                usleep(150_000)
                 continue
             }
             defer { close(client) }
@@ -231,7 +389,10 @@ enum SMCHelperServer {
 
             switch request.cmd {
             case "ping":
-                _ = writeLine(to: client, SMCHelperResponse(ok: true))
+                _ = writeLine(
+                    to: client,
+                    SMCHelperResponse(ok: true, root: geteuid() == 0, uid: UInt32(geteuid()))
+                )
 
             case "apply":
                 let mode = FanControlMode(rawValue: request.mode ?? "") ?? .system
@@ -244,6 +405,7 @@ enum SMCHelperServer {
                     controlTemperature: [snapshot.cpuC, snapshot.gpuC].compactMap { $0 }.max(),
                     fans: snapshot.fans
                 )
+                log("apply mode=\(mode.rawValue) error=\(outcome.error ?? "none") targets=\(outcome.targets)")
                 var encodedTargets: [String: Double] = [:]
                 outcome.targets.forEach { encodedTargets[String($0.key)] = $0.value }
                 _ = writeLine(
@@ -252,24 +414,24 @@ enum SMCHelperServer {
                         ok: outcome.error == nil,
                         needsPrivilege: outcome.needsPrivilege,
                         error: outcome.error,
-                        targets: encodedTargets
+                        targets: encodedTargets,
+                        root: geteuid() == 0,
+                        uid: UInt32(geteuid())
                     )
                 )
 
             case "restore":
                 reader.restoreAutomaticFans(fanCount: request.fanCount ?? 8)
-                _ = writeLine(to: client, SMCHelperResponse(ok: true))
+                _ = writeLine(to: client, SMCHelperResponse(ok: true, root: true, uid: 0))
 
             case "quit":
-                _ = writeLine(to: client, SMCHelperResponse(ok: true))
+                _ = writeLine(to: client, SMCHelperResponse(ok: true, root: true, uid: 0))
                 restoreAndExit()
 
             default:
                 _ = writeLine(to: client, SMCHelperResponse(ok: false, error: "unknown command"))
             }
         }
-
-        _ = arguments
     }
 
     private static func argumentValue(_ name: String) -> String? {
@@ -314,7 +476,7 @@ enum SMCHelperServer {
     }
 }
 
-private struct SMCHelperRequest: Codable {
+struct SMCHelperRequest: Codable {
     var cmd: String
     var mode: String?
     var manualPercent: Double?
@@ -323,15 +485,28 @@ private struct SMCHelperRequest: Codable {
     var fanCount: Int?
 }
 
-private struct SMCHelperResponse: Codable {
+struct SMCHelperResponse: Codable {
     var ok: Bool
     var needsPrivilege: Bool?
     var error: String?
     var targets: [String: Double]?
+    var root: Bool?
+    var uid: UInt32?
 }
 
 private enum SMCHelperError: Error {
     case connect
+}
+
+private func posixQuoted(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+private func appleScriptQuoted(_ value: String) -> String {
+    "\"" + value
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    + "\""
 }
 
 private func unixAddress(_ path: String) -> sockaddr_un {

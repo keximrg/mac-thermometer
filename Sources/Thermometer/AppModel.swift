@@ -14,13 +14,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var fanTargets: [Int: Double] = [:]
     @Published private(set) var fanControlError: String?
     @Published private(set) var fanControlNeedsAuthorization = false
+    @Published private(set) var fanControlAuthorized = false
 
     private let sensorQueue = DispatchQueue(label: "com.thermometer.sensors", qos: .utility)
     private var reader: HardwareSensorReader?
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
     private var pendingRefresh = false
-    private var privilegePromptAttempted = false
+    private var didAskForLaunchAuthorization = false
 
     init(preferences: AppPreferences = AppPreferences()) {
         self.preferences = preferences
@@ -43,11 +44,6 @@ final class AppModel: ObservableObject {
             .removeDuplicates()
             .dropFirst()
             .sink { [weak self] enabled in self?.setLaunchAtLogin(enabled) }
-            .store(in: &cancellables)
-
-        preferences.$fanControlMode
-            .dropFirst()
-            .sink { [weak self] _ in self?.privilegePromptAttempted = false }
             .store(in: &cancellables)
 
         preferences.$fanControlMode
@@ -102,6 +98,7 @@ final class AppModel: ObservableObject {
                 self.reader = HardwareSensorReader()
             }
             let raw = self.reader?.sample()
+            let requiresPrivilege = self.reader?.requiresPrivilegedFanWrites() ?? true
             let outcome = raw.flatMap { snapshot in
                 self.applyFanControlOnQueue(
                     mode: mode,
@@ -129,12 +126,15 @@ final class AppModel: ObservableObject {
                     self.snapshot = value
                     self.lastError = nil
                     self.fanTargets = outcome?.targets ?? [:]
-                    self.fanControlError = outcome?.error
-                    if outcome?.needsPrivilege == true {
-                        self.requestFanAuthorizationIfNeeded()
-                    } else if outcome?.error == nil {
+                    self.fanControlAuthorized = SMCHelperService.isPrivilegedHelperRunning()
+                    if self.fanControlAuthorized {
                         self.fanControlNeedsAuthorization = false
                     }
+                    self.fanControlError = outcome?.error
+                    self.requestLaunchAuthorizationIfNeeded(
+                        hasFans: !value.fans.isEmpty,
+                        requiresPrivilege: requiresPrivilege
+                    )
                     self.appendHistory(value)
                 } else {
                     self.lastError = "暂时无法连接硬件传感器"
@@ -238,8 +238,19 @@ final class AppModel: ObservableObject {
     }
 
     func authorizeFanControl() {
-        privilegePromptAttempted = false
-        requestFanAuthorizationIfNeeded()
+        fanControlNeedsAuthorization = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if SMCHelperService.ensureRunning(allowInteraction: true) {
+                self.fanControlAuthorized = true
+                self.fanControlNeedsAuthorization = false
+                self.fanControlError = nil
+                self.forceRefresh()
+            } else {
+                self.fanControlAuthorized = false
+                self.fanControlError = "需要管理员密码才能调节风扇"
+            }
+        }
     }
 
     func diagnosticLines(completion: @escaping ([String]) -> Void) {
@@ -266,14 +277,42 @@ final class AppModel: ObservableObject {
         curveFullC: Double,
         snapshot: RawSensorSnapshot
     ) -> FanControlOutcome? {
-        if mode != .system, SMCHelperService.isRunning() {
-            return SMCHelperService.apply(
-                mode: mode,
-                manualPercent: manualPercent,
-                curveStartC: curveStartC,
-                curveFullC: curveFullC
+        let requiresHelper = reader?.requiresPrivilegedFanWrites() ?? true
+        let helperReady = SMCHelperService.isPrivilegedHelperRunning()
+
+        if mode == .system {
+            if helperReady {
+                SMCHelperService.restore(fanCount: max(snapshot.fans.count, 1))
+            } else {
+                reader?.restoreAutomaticFans(fanCount: max(snapshot.fans.count, 1))
+            }
+            return FanControlOutcome(targets: [:], error: nil)
+        }
+
+        if requiresHelper {
+            if helperReady {
+                return SMCHelperService.apply(
+                    mode: mode,
+                    manualPercent: manualPercent,
+                    curveStartC: curveStartC,
+                    curveFullC: curveFullC
+                )
+            }
+            if SMCHelperService.ensureRunning(allowInteraction: false) {
+                return SMCHelperService.apply(
+                    mode: mode,
+                    manualPercent: manualPercent,
+                    curveStartC: curveStartC,
+                    curveFullC: curveFullC
+                )
+            }
+            return FanControlOutcome(
+                targets: [:],
+                error: didAskForLaunchAuthorization ? "风扇控制未授权，请输入一次管理员密码" : nil,
+                needsPrivilege: true
             )
         }
+
         return reader?.applyFanControl(
             mode: mode,
             manualPercent: manualPercent,
@@ -284,32 +323,28 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func requestFanAuthorizationIfNeeded() {
-        fanControlNeedsAuthorization = true
-        guard !privilegePromptAttempted else { return }
-        privilegePromptAttempted = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if SMCHelperService.authorizeAndStart() {
-                self.fanControlNeedsAuthorization = false
-                self.fanControlError = nil
-                self.forceRefresh()
-            } else {
-                self.fanControlError = "需要管理员密码才能调节风扇"
-            }
+    private func requestLaunchAuthorizationIfNeeded(hasFans: Bool, requiresPrivilege: Bool) {
+        guard hasFans, requiresPrivilege, !didAskForLaunchAuthorization else { return }
+        didAskForLaunchAuthorization = true
+        if SMCHelperService.isPrivilegedHelperRunning() {
+            fanControlAuthorized = true
+            fanControlNeedsAuthorization = false
+            return
         }
+        authorizeFanControl()
     }
 
     private func restoreAutomaticFans() {
         let fanCount = max(snapshot.fans.count, 1)
         sensorQueue.sync {
-            if SMCHelperService.isRunning() {
+            if SMCHelperService.isPrivilegedHelperRunning() {
                 SMCHelperService.restore(fanCount: fanCount)
                 if self.timer == nil {
                     SMCHelperService.shutdown()
                 }
+            } else {
+                self.reader?.restoreAutomaticFans(fanCount: fanCount)
             }
-            self.reader?.restoreAutomaticFans(fanCount: fanCount)
         }
         fanTargets = [:]
         fanControlError = nil
@@ -318,10 +353,11 @@ final class AppModel: ObservableObject {
     private func resetReaderAndRefresh() {
         let fanCount = max(snapshot.fans.count, 1)
         sensorQueue.async { [weak self] in
-            if SMCHelperService.isRunning() {
+            if SMCHelperService.isPrivilegedHelperRunning() {
                 SMCHelperService.restore(fanCount: fanCount)
+            } else {
+                self?.reader?.restoreAutomaticFans(fanCount: fanCount)
             }
-            self?.reader?.restoreAutomaticFans(fanCount: fanCount)
             self?.reader = nil
             DispatchQueue.main.async { self?.forceRefresh() }
         }

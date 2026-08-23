@@ -45,9 +45,22 @@ enum SMCWriteStatus: Equatable {
     case missingKey
     case rejected(UInt8)
     case failed
+    case unverified
 
     var succeeded: Bool {
         self == .success || self == .acceptedWithWarning
+    }
+
+    var description: String {
+        switch self {
+        case .success: return "ok"
+        case .acceptedWithWarning: return "accepted"
+        case .notPrivileged: return "not privileged"
+        case .missingKey: return "missing key"
+        case .rejected(let code): return String(format: "smc 0x%02x", code)
+        case .failed: return "failed"
+        case .unverified: return "write did not stick"
+        }
     }
 }
 
@@ -237,6 +250,12 @@ final class HardwareSensorReader {
         return lastDiagnostics
     }
 
+    func requiresPrivilegedFanWrites() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return family != .intel
+    }
+
     private func averageSMC(keys: [String], source: String) -> MetricReading? {
         guard let smc, !keys.isEmpty else { return nil }
 
@@ -375,7 +394,7 @@ final class HardwareSensorReader {
                 }
             }
 
-            guard let smc else {
+            guard smc != nil else {
                 return FanControlOutcome(
                     targets: [:],
                     error: "无法连接 SMC"
@@ -393,25 +412,29 @@ final class HardwareSensorReader {
                 let ceiling = max(maximum, minimum)
                 let target = (minimum + percent * (ceiling - minimum)).clamped(to: minimum...ceiling)
                 let modeStatus = setFanForcedLocked(fan.index, forced: true)
-                if modeStatus == .notPrivileged {
+                if modeStatus == .notPrivileged || (modeStatus != .success && geteuid() != 0) {
                     needsPrivilege = true
                     lastFailure = "需要管理员权限才能调节风扇"
                     continue
+                }
+
+                if modeStatus.succeeded {
+                    Thread.sleep(forTimeInterval: 0.05)
                 }
 
                 let targetKey = "F\(fan.index)Tg"
-                let wrote = smc.writeNumberStatus(targetKey, target)
-                if wrote == .notPrivileged {
+                let wrote = smc?.writeNumberStatus(targetKey, target) ?? .failed
+                if wrote == .notPrivileged || (wrote != .success && wrote != .acceptedWithWarning && geteuid() != 0) {
                     needsPrivilege = true
                     lastFailure = "需要管理员权限才能调节风扇"
                     continue
                 }
 
-                if modeStatus.succeeded || wrote.succeeded {
+                if wrote.succeeded {
                     anySuccess = true
                     targets[fan.index] = target
                 } else {
-                    lastFailure = "无法写入风扇 \(fan.index + 1) 的转速"
+                    lastFailure = "无法写入风扇 \(fan.index + 1)：模式 \(modeStatus.description)，目标 \(wrote.description)"
                 }
             }
 
@@ -487,6 +510,17 @@ final class HardwareSensorReader {
         }
 
         if statuses.contains(.notPrivileged) {
+            return .notPrivileged
+        }
+        if let modeKey = modeKeyLocked(for: index), let current = smc.readNumber(modeKey) {
+            if forced, abs(current - 1) <= 0.1 {
+                return .success
+            }
+            if !forced, abs(current - 1) > 0.1 {
+                return .success
+            }
+        }
+        if geteuid() != 0 {
             return .notPrivileged
         }
         if statuses.contains(where: \.succeeded) {
@@ -748,7 +782,6 @@ private final class SMCReader {
     private static let readBytesCommand: UInt8 = 5
     private static let writeBytesCommand: UInt8 = 6
     private static let readKeyInfoCommand: UInt8 = 9
-    private static let smcKeyNotWritable: UInt8 = 0x87
     private static let notPrivileged = Int32(bitPattern: 0xE00002C2)
     private static let notPermitted = Int32(bitPattern: 0xE00002C1)
 
@@ -856,27 +889,43 @@ private final class SMCReader {
     }
 
     func writeNumberStatus(_ key: String, _ value: Double) -> SMCWriteStatus {
-        guard let info = fetchKeyInfo(key) else { return .missingKey }
-        let type = Self.fourCharacterString(info.dataType)
-        let size = Int(info.dataSize)
-        guard size > 0, size <= 32,
-              var payload = Self.encodeNumber(value, type: type) else {
-            return .failed
+        let connections = writeConnections()
+        var lastStatus: SMCWriteStatus = .failed
+        for connection in connections {
+            guard let info = fetchKeyInfo(key, connection: connection, useCache: connection == self.connection) else {
+                lastStatus = .missingKey
+                continue
+            }
+            let type = Self.fourCharacterString(info.dataType)
+            let size = Int(info.dataSize)
+            guard size > 0, size <= 32,
+                  var payload = Self.encodeNumber(value, type: type) else {
+                lastStatus = .failed
+                continue
+            }
+            if payload.count < size {
+                payload.append(contentsOf: repeatElement(0, count: size - payload.count))
+            } else if payload.count > size {
+                payload = Array(payload.prefix(size))
+            }
+            lastStatus = writeBytes(key, payload, info: info, connection: connection)
+            if lastStatus.succeeded || lastStatus == .notPrivileged {
+                return lastStatus
+            }
         }
-        if payload.count < size {
-            payload.append(contentsOf: repeatElement(0, count: size - payload.count))
-        } else if payload.count > size {
-            payload = Array(payload.prefix(size))
-        }
-        return writeBytes(key, payload, info: info)
+        return lastStatus
     }
 
     private func fetchKeyInfo(_ key: String) -> SMCKeyInfoData? {
+        fetchKeyInfo(key, connection: connection, useCache: true)
+    }
+
+    private func fetchKeyInfo(_ key: String, connection: io_connect_t, useCache: Bool) -> SMCKeyInfoData? {
         guard key.utf8.count == 4 else { return nil }
-        if let cached = keyInfoCache[key] {
+        if useCache, let cached = keyInfoCache[key] {
             return cached
         }
-        if missingKeys.contains(key) {
+        if useCache, missingKeys.contains(key) {
             return nil
         }
 
@@ -886,21 +935,37 @@ private final class SMCReader {
         let (output, kernResult) = call(input, connection: connection)
         guard kernResult == kIOReturnSuccess, let output, output.result == 0,
               output.keyInfo.dataSize > 0, output.keyInfo.dataSize <= 32 else {
-            missingKeys.insert(key)
+            if useCache {
+                missingKeys.insert(key)
+            }
             return nil
         }
-        keyInfoCache[key] = output.keyInfo
+        if useCache {
+            keyInfoCache[key] = output.keyInfo
+        }
         return output.keyInfo
     }
 
-    private func writeBytes(_ key: String, _ data: [UInt8], info: SMCKeyInfoData) -> SMCWriteStatus {
+    private func writeConnections() -> [io_connect_t] {
+        if writeConnection != 0, writeConnection != connection {
+            return [writeConnection, connection]
+        }
+        return [connection]
+    }
+
+    private func writeBytes(
+        _ key: String,
+        _ data: [UInt8],
+        info: SMCKeyInfoData,
+        connection: io_connect_t
+    ) -> SMCWriteStatus {
         var input = SMCParamStruct()
         input.key = Self.fourCharacterCode(key)
         input.keyInfo = info
         input.keyInfo.dataSize = UInt32(data.count)
         input.data8 = Self.writeBytesCommand
         input.bytes = Self.packBytes(data)
-        let (output, kernResult) = call(input, connection: writeConnection)
+        let (output, kernResult) = call(input, connection: connection)
         if Self.isPrivilegeError(kernResult) {
             return .notPrivileged
         }
@@ -908,9 +973,12 @@ private final class SMCReader {
         if output.result == 0 {
             return .success
         }
-        // Some Apple Silicon machines apply target writes despite 0x87.
-        if output.result == Self.smcKeyNotWritable, key.hasSuffix("Tg") {
+        // Apple Silicon sometimes returns 0x87 for F*Tg even when the target is applied.
+        if output.result == 0x87, key.hasSuffix("Tg") {
             return .acceptedWithWarning
+        }
+        if geteuid() != 0 {
+            return .notPrivileged
         }
         return .rejected(output.result)
     }

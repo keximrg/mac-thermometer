@@ -29,6 +29,7 @@ for ARCH in "${ARCHS[@]}"; do
         -framework SwiftUI \
         -framework IOKit \
         -framework ServiceManagement \
+        -framework Security \
         -framework UniformTypeIdentifiers \
         "${SOURCES[@]}" \
         -o "$ARCH_ROOT/Thermometer"
