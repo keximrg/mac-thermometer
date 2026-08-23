@@ -559,7 +559,7 @@ private struct FanControlSection: View {
                 }
 
                 if preferences.fanControlMode == .manual {
-                    SettingsPanel(title: "自定义转速", subtitle: "按每个风扇自己的最低到最高转速范围锁定") {
+                    SettingsPanel(title: "自定义转速", subtitle: "从 0 转到每个风扇自己的最高转速") {
                         VStack(spacing: 13) {
                             ValueSlider(
                                 title: "转速",
@@ -574,7 +574,7 @@ private struct FanControlSection: View {
                             ForEach(appModel.snapshot.fans) { fan in
                                 InformationRow(
                                     title: fan.name,
-                                    value: "\(Int(appModel.estimatedFanRPM(for: fan, percent: preferences.fanManualPercent).rounded())) RPM"
+                                    value: "\(Int(appModel.estimatedFanRPM(for: fan, percent: preferences.fanManualPercent, fromZero: true).rounded())) RPM"
                                 )
                             }
                         }

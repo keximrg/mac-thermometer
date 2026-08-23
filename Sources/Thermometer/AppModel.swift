@@ -222,11 +222,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func estimatedFanRPM(for fan: FanReading, percent: Double) -> Double {
-        let minimum = fan.minRPM ?? 0
-        let maximum = fan.maxRPM ?? max(fan.rpm, 4_000)
-        let ceiling = max(maximum, minimum)
-        return (minimum + percent.clamped(to: 0...1) * (ceiling - minimum)).clamped(to: minimum...ceiling)
+    func estimatedFanRPM(for fan: FanReading, percent: Double, fromZero: Bool = false) -> Double {
+        fan.targetRPM(percent: percent, fromZero: fromZero)
     }
 
     func temperatureCurvePercent(for temperature: Double) -> Double {

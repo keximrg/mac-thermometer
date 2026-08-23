@@ -13,6 +13,12 @@ struct FanReading: Identifiable, Hashable, Sendable {
     let maxRPM: Double?
 
     var id: Int { index }
+
+    func targetRPM(percent: Double, fromZero: Bool) -> Double {
+        let floor = fromZero ? 0 : (minRPM ?? 0)
+        let ceiling = max(maxRPM ?? max(rpm, 4_000), floor)
+        return (floor + percent.clamped(to: 0...1) * (ceiling - floor)).clamped(to: floor...ceiling)
+    }
 }
 
 struct RawSensorSnapshot: Sendable {
@@ -407,10 +413,7 @@ final class HardwareSensorReader {
             var needsPrivilege = false
 
             for fan in fans {
-                let minimum = fan.minRPM ?? 0
-                let maximum = fan.maxRPM ?? max(fan.rpm, 4_000)
-                let ceiling = max(maximum, minimum)
-                let target = (minimum + percent * (ceiling - minimum)).clamped(to: minimum...ceiling)
+                let target = fan.targetRPM(percent: percent, fromZero: mode == .manual)
                 let modeStatus = setFanForcedLocked(fan.index, forced: true)
                 if modeStatus == .notPrivileged || (modeStatus != .success && geteuid() != 0) {
                     needsPrivilege = true
