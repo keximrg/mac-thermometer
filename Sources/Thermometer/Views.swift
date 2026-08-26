@@ -283,7 +283,6 @@ private struct OverviewSection: View {
                     fans: appModel.snapshot.fans,
                     formattedValue: appModel.formatValue(for: .fan),
                     history: appModel.history[.fan] ?? [],
-                    mode: preferences.fanControlMode,
                     targets: appModel.fanTargets
                 )
 
@@ -391,7 +390,6 @@ private struct FanCard: View {
     let fans: [FanReading]
     let formattedValue: String
     let history: [Double]
-    let mode: FanControlMode
     let targets: [Int: Double]
 
     var body: some View {
@@ -406,13 +404,8 @@ private struct FanCard: View {
                 }
                 .frame(width: 38, height: 38)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("散热风扇")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(fans.isEmpty ? "未检测到可读风扇" : "\(fans.count) 个风扇 · \(mode.title)")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.tertiary)
-                }
+                Text("散热风扇")
+                    .font(.system(size: 13, weight: .semibold))
 
                 Spacer()
 
@@ -523,7 +516,6 @@ private struct FanControlSection: View {
                         fans: appModel.snapshot.fans,
                         formattedValue: appModel.formatValue(for: .fan),
                         history: appModel.history[.fan] ?? [],
-                        mode: preferences.fanControlMode,
                         targets: appModel.fanTargets
                     )
                 }
@@ -605,17 +597,6 @@ private struct FanControlSection: View {
                     .controlSize(.small)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-
-                SettingsPanel(title: "说明", subtitle: nil) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(statusText)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.secondary)
-                        Text("启动时输入一次管理员密码后，本次使用都可直接改转速。退出应用、睡眠或改回系统自动时，会把控制权交还给 macOS。")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 16)
@@ -670,36 +651,6 @@ private struct FanControlSection: View {
             percent: appModel.temperatureCurvePercent(for: temperature)
         )
         return "\(Int(rpm.rounded())) RPM"
-    }
-
-    private var statusText: String {
-        if appModel.snapshot.fans.isEmpty {
-            return "没有检测到可控制的风扇。无风扇机型（例如部分 MacBook Air）会保持这个状态。"
-        }
-        if appModel.fanControlAuthorized {
-            switch preferences.fanControlMode {
-            case .system:
-                return "风扇控制已授权。当前仍由 macOS 自动调节，切换到自定义或按温度后立即生效。"
-            case .temperature:
-                return "风扇控制已授权。当前按 CPU/GPU 较高一侧的温度调节风扇。"
-            case .manual:
-                return "风扇控制已授权。拖动转速即可改，无需再输入密码。"
-            }
-        }
-        if appModel.fanControlNeedsAuthorization {
-            return "启动时授权一次即可，授权后改转速不会再要密码。"
-        }
-        if !appModel.snapshot.fanControlAvailable {
-            return "已读到风扇转速，但当前机型不允许软件改写转速。"
-        }
-        switch preferences.fanControlMode {
-        case .system:
-            return "当前由 macOS 控制风扇，Thermometer 只显示转速。"
-        case .temperature:
-            return "当前按 CPU/GPU 较高的一侧温度调节风扇。"
-        case .manual:
-            return "当前使用自定义转速，直到改回系统自动或退出应用。"
-        }
     }
 }
 
