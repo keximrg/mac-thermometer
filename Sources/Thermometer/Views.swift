@@ -490,7 +490,7 @@ private struct FanControlSection: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 12) {
-                SettingsPanel(title: "控制方式", subtitle: "启动时授权一次；之后改转速不再要密码") {
+                SettingsPanel(title: "控制方式", subtitle: "授权一次即可；关机、重启和改转速都不再要密码") {
                     VStack(spacing: 10) {
                         HStack(spacing: 7) {
                             ForEach(FanControlMode.allCases) { mode in

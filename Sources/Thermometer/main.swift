@@ -1,6 +1,10 @@
 import AppKit
 import Foundation
 
+if CommandLine.arguments.contains("--install-privileged-helper") {
+    exit(SMCHelperInstaller.run())
+}
+
 if CommandLine.arguments.contains("--smc-helper") {
     SMCHelperServer.run()
     exit(EXIT_SUCCESS)

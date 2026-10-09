@@ -94,6 +94,7 @@ final class AppModel: ObservableObject {
 
         sensorQueue.async { [weak self] in
             guard let self else { return }
+            SMCHelperService.retireLegacySessionHelper()
             if self.reader == nil {
                 self.reader = HardwareSensorReader()
             }
@@ -245,7 +246,7 @@ final class AppModel: ObservableObject {
                 self.forceRefresh()
             } else {
                 self.fanControlAuthorized = false
-                self.fanControlError = "需要管理员密码才能调节风扇"
+                self.fanControlError = SMCHelperService.lastFailureMessage ?? "需要管理员密码才能安装风扇助手。安装一次后，关机和重启都不会再询问密码。"
             }
         }
     }
@@ -305,7 +306,9 @@ final class AppModel: ObservableObject {
             }
             return FanControlOutcome(
                 targets: [:],
-                error: didAskForLaunchAuthorization ? "风扇控制未授权，请输入一次管理员密码" : nil,
+                error: didAskForLaunchAuthorization
+                    ? (SMCHelperService.lastFailureMessage ?? "风扇控制未授权。授权一次后，关机不再询问密码。")
+                    : nil,
                 needsPrivilege: true
             )
         }
@@ -321,7 +324,10 @@ final class AppModel: ObservableObject {
     }
 
     private func requestLaunchAuthorizationIfNeeded(hasFans: Bool, requiresPrivilege: Bool) {
-        guard hasFans, requiresPrivilege, !didAskForLaunchAuthorization else { return }
+        guard hasFans,
+              requiresPrivilege,
+              preferences.fanControlMode != .system,
+              !didAskForLaunchAuthorization else { return }
         didAskForLaunchAuthorization = true
         if SMCHelperService.isPrivilegedHelperRunning() {
             fanControlAuthorized = true
@@ -336,9 +342,6 @@ final class AppModel: ObservableObject {
         sensorQueue.sync {
             if SMCHelperService.isPrivilegedHelperRunning() {
                 SMCHelperService.restore(fanCount: fanCount)
-                if self.timer == nil {
-                    SMCHelperService.shutdown()
-                }
             } else {
                 self.reader?.restoreAutomaticFans(fanCount: fanCount)
             }
